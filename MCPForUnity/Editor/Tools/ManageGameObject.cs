@@ -1794,19 +1794,45 @@ namespace MCPForUnity.Editor.Tools
             return results.Distinct().ToList(); // Ensure uniqueness
         }
 
-        // Helper to get all scene objects efficiently
+        // Helper to get all scene objects efficiently (including DontDestroyOnLoad)
         private static IEnumerable<GameObject> GetAllSceneObjects(bool includeInactive)
         {
-            // SceneManager.GetActiveScene().GetRootGameObjects() is faster than FindObjectsOfType<GameObject>()
-            var rootObjects = SceneManager.GetActiveScene().GetRootGameObjects();
             var allObjects = new List<GameObject>();
-            foreach (var root in rootObjects)
+
+            // Get objects from all loaded scenes
+            for (int i = 0; i < SceneManager.sceneCount; i++)
             {
-                allObjects.AddRange(
-                    root.GetComponentsInChildren<Transform>(includeInactive)
-                        .Select(t => t.gameObject)
-                );
+                var scene = SceneManager.GetSceneAt(i);
+                if (scene.isLoaded)
+                {
+                    foreach (var root in scene.GetRootGameObjects())
+                    {
+                        allObjects.AddRange(
+                            root.GetComponentsInChildren<Transform>(includeInactive)
+                                .Select(t => t.gameObject)
+                        );
+                    }
+                }
             }
+
+            // Get DontDestroyOnLoad objects (only available in Play mode)
+            if (Application.isPlaying)
+            {
+                var dontDestroyObjects = Resources.FindObjectsOfTypeAll<GameObject>()
+                    .Where(go => go.transform.parent == null &&
+                                 go.scene.name == "DontDestroyOnLoad" &&
+                                 !EditorUtility.IsPersistent(go) &&
+                                 (includeInactive || go.activeInHierarchy));
+
+                foreach (var root in dontDestroyObjects)
+                {
+                    allObjects.AddRange(
+                        root.GetComponentsInChildren<Transform>(includeInactive)
+                            .Select(t => t.gameObject)
+                    );
+                }
+            }
+
             return allObjects;
         }
 
