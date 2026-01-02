@@ -1818,7 +1818,7 @@ namespace MCPForUnity.Editor.Tools
             // Get DontDestroyOnLoad objects (only available in Play mode)
             if (Application.isPlaying)
             {
-                var dontDestroyObjects = Resources.FindObjectsOfTypeAll<GameObject>()
+                var dontDestroyObjects = UnityEngine.Resources.FindObjectsOfTypeAll<GameObject>()
                     .Where(go => go.transform.parent == null &&
                                  go.scene.name == "DontDestroyOnLoad" &&
                                  !EditorUtility.IsPersistent(go) &&
