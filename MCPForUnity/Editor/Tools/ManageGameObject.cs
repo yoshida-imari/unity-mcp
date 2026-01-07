@@ -22,20 +22,8 @@ namespace MCPForUnity.Editor.Tools
     [McpForUnityTool("manage_gameobject", AutoRegister = false)]
     public static class ManageGameObject
     {
-        // Shared JsonSerializer to avoid per-call allocation overhead
-        internal static readonly JsonSerializer InputSerializer = JsonSerializer.Create(new JsonSerializerSettings
-        {
-            Converters = new List<JsonConverter>
-            {
-                new Vector3Converter(),
-                new Vector2Converter(),
-                new QuaternionConverter(),
-                new ColorConverter(),
-                new RectConverter(),
-                new BoundsConverter(),
-                new UnityEngineObjectConverter()
-            }
-        });
+        // Use shared serializer from helper class (backwards-compatible alias)
+        internal static JsonSerializer InputSerializer => UnityJsonSerializer.Instance;
 
         // --- Main Handler ---
 
@@ -73,10 +61,6 @@ namespace MCPForUnity.Editor.Tools
             string layer = @params["layer"]?.ToString();
             JToken parentToken = @params["parent"];
 
-            // --- Add parameter for controlling non-public field inclusion ---
-            bool includeNonPublicSerialized = @params["includeNonPublicSerialized"]?.ToObject<bool>() ?? true; // Default to true
-            // --- End add parameter ---
-
             // Coerce string JSON to JObject for 'componentProperties' if provided as a JSON string
             var componentPropsToken = @params["componentProperties"];
             if (componentPropsToken != null && componentPropsToken.Type == JTokenType.String)
@@ -88,154 +72,39 @@ namespace MCPForUnity.Editor.Tools
                 }
                 catch (Exception e)
                 {
-                    Debug.LogWarning($"[ManageGameObject] Could not parse 'componentProperties' JSON string: {e.Message}");
+                    McpLog.Warn($"[ManageGameObject] Could not parse 'componentProperties' JSON string: {e.Message}");
                 }
             }
 
-            // --- Prefab Redirection Check ---
+            // --- Prefab Asset Check ---
+            // Prefab assets require different tools. Only 'create' (instantiation) is valid here.
             string targetPath =
                 targetToken?.Type == JTokenType.String ? targetToken.ToString() : null;
             if (
                 !string.IsNullOrEmpty(targetPath)
                 && targetPath.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase)
+                && action != "create" // Allow prefab instantiation
             )
             {
-                // Allow 'create' (instantiate), 'find' (?), 'get_components' (?)
-                if (action == "modify" || action == "set_component_property")
-                {
-                    Debug.Log(
-                        $"[ManageGameObject->ManageAsset] Redirecting action '{action}' for prefab '{targetPath}' to ManageAsset."
-                    );
-                    // Prepare params for ManageAsset.ModifyAsset
-                    JObject assetParams = new JObject();
-                    assetParams["action"] = "modify"; // ManageAsset uses "modify"
-                    assetParams["path"] = targetPath;
-
-                    // Extract properties.
-                    // For 'set_component_property', combine componentName and componentProperties.
-                    // For 'modify', directly use componentProperties.
-                    JObject properties = null;
-                    if (action == "set_component_property")
-                    {
-                        string compName = @params["componentName"]?.ToString();
-                        JObject compProps = @params["componentProperties"]?[compName] as JObject; // Handle potential nesting
-                        if (string.IsNullOrEmpty(compName))
-                            return new ErrorResponse(
-                                "Missing 'componentName' for 'set_component_property' on prefab."
-                            );
-                        if (compProps == null)
-                            return new ErrorResponse(
-                                $"Missing or invalid 'componentProperties' for component '{compName}' for 'set_component_property' on prefab."
-                            );
-
-                        properties = new JObject();
-                        properties[compName] = compProps;
-                    }
-                    else // action == "modify"
-                    {
-                        properties = @params["componentProperties"] as JObject;
-                        if (properties == null)
-                            return new ErrorResponse(
-                                "Missing 'componentProperties' for 'modify' action on prefab."
-                            );
-                    }
-
-                    assetParams["properties"] = properties;
-
-                    // Call ManageAsset handler
-                    return ManageAsset.HandleCommand(assetParams);
-                }
-                else if (
-                    action == "delete"
-                    || action == "add_component"
-                    || action == "remove_component"
-                    || action == "get_components"
-                ) // Added get_components here too
-                {
-                    // Explicitly block other modifications on the prefab asset itself via manage_gameobject
-                    return new ErrorResponse(
-                        $"Action '{action}' on a prefab asset ('{targetPath}') should be performed using the 'manage_asset' command."
-                    );
-                }
-                // Allow 'create' (instantiation) and 'find' to proceed, although finding a prefab asset by path might be less common via manage_gameobject.
-                // No specific handling needed here, the code below will run.
+                return new ErrorResponse(
+                    $"Target '{targetPath}' is a prefab asset. " +
+                    $"Use 'manage_asset' with action='modify' for prefab asset modifications, " +
+                    $"or 'manage_prefabs' with action='open_stage' to edit the prefab in isolation mode."
+                );
             }
-            // --- End Prefab Redirection Check ---
+            // --- End Prefab Asset Check ---
 
             try
             {
                 switch (action)
                 {
+                    // --- Primary lifecycle actions (kept in manage_gameobject) ---
                     case "create":
                         return CreateGameObject(@params);
                     case "modify":
                         return ModifyGameObject(@params, targetToken, searchMethod);
                     case "delete":
                         return DeleteGameObject(targetToken, searchMethod);
-                    case "find":
-                        return FindGameObjects(@params, targetToken, searchMethod);
-                    case "get_components":
-                        string getCompTarget = targetToken?.ToString(); // Expect name, path, or ID string
-                        if (getCompTarget == null)
-                            return new ErrorResponse(
-                                "'target' parameter required for get_components."
-                            );
-                        // Paging + safety: return metadata by default; deep fields are opt-in.
-                        int CoerceInt(JToken t, int @default)
-                        {
-                            if (t == null || t.Type == JTokenType.Null) return @default;
-                            try
-                            {
-                                if (t.Type == JTokenType.Integer) return t.Value<int>();
-                                var s = t.ToString().Trim();
-                                if (s.Length == 0) return @default;
-                                if (int.TryParse(s, out var i)) return i;
-                                if (double.TryParse(s, out var d)) return (int)d;
-                            }
-                            catch { }
-                            return @default;
-                        }
-                        bool CoerceBool(JToken t, bool @default)
-                        {
-                            if (t == null || t.Type == JTokenType.Null) return @default;
-                            try
-                            {
-                                if (t.Type == JTokenType.Boolean) return t.Value<bool>();
-                                var s = t.ToString().Trim();
-                                if (s.Length == 0) return @default;
-                                if (bool.TryParse(s, out var b)) return b;
-                                if (s == "1") return true;
-                                if (s == "0") return false;
-                            }
-                            catch { }
-                            return @default;
-                        }
-
-                        int pageSize = CoerceInt(@params["pageSize"] ?? @params["page_size"], 25);
-                        int cursor = CoerceInt(@params["cursor"], 0);
-                        int maxComponents = CoerceInt(@params["maxComponents"] ?? @params["max_components"], 50);
-                        bool includeProperties = CoerceBool(@params["includeProperties"] ?? @params["include_properties"], false);
-
-                        // Pass the includeNonPublicSerialized flag through, but only used if includeProperties is true.
-                        return GetComponentsFromTarget(getCompTarget, searchMethod, includeNonPublicSerialized, pageSize, cursor, maxComponents, includeProperties);
-                    case "get_component":
-                        string getSingleCompTarget = targetToken?.ToString();
-                        if (getSingleCompTarget == null)
-                            return new ErrorResponse(
-                                "'target' parameter required for get_component."
-                            );
-                        string componentName = @params["componentName"]?.ToString();
-                        if (string.IsNullOrEmpty(componentName))
-                            return new ErrorResponse(
-                                "'componentName' parameter required for get_component."
-                            );
-                        return GetSingleComponentFromTarget(getSingleCompTarget, searchMethod, componentName, includeNonPublicSerialized);
-                    case "add_component":
-                        return AddComponentToTarget(@params, targetToken, searchMethod);
-                    case "remove_component":
-                        return RemoveComponentFromTarget(@params, targetToken, searchMethod);
-                    case "set_component_property":
-                        return SetComponentPropertyOnTarget(@params, targetToken, searchMethod);
                     case "duplicate":
                         return DuplicateGameObject(@params, targetToken, searchMethod);
                     case "move_relative":
@@ -247,7 +116,7 @@ namespace MCPForUnity.Editor.Tools
             }
             catch (Exception e)
             {
-                Debug.LogError($"[ManageGameObject] Action '{action}' failed: {e}");
+                McpLog.Error($"[ManageGameObject] Action '{action}' failed: {e}");
                 return new ErrorResponse($"Internal error processing action '{action}': {e.Message}");
             }
         }
@@ -280,7 +149,7 @@ namespace MCPForUnity.Editor.Tools
                 )
                 {
                     string prefabNameOnly = prefabPath;
-                    Debug.Log(
+                    McpLog.Info(
                         $"[ManageGameObject.Create] Searching for prefab named: '{prefabNameOnly}'"
                     );
                     string[] guids = AssetDatabase.FindAssets($"t:Prefab {prefabNameOnly}");
@@ -303,7 +172,7 @@ namespace MCPForUnity.Editor.Tools
                     else // Exactly one found
                     {
                         prefabPath = AssetDatabase.GUIDToAssetPath(guids[0]); // Update prefabPath with the full path
-                        Debug.Log(
+                        McpLog.Info(
                             $"[ManageGameObject.Create] Found unique prefab at path: '{prefabPath}'"
                         );
                     }
@@ -311,7 +180,7 @@ namespace MCPForUnity.Editor.Tools
                 else if (!prefabPath.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
                 {
                     // If it looks like a path but doesn't end with .prefab, assume user forgot it and append it.
-                    Debug.LogWarning(
+                    McpLog.Warn(
                         $"[ManageGameObject.Create] Provided prefabPath '{prefabPath}' does not end with .prefab. Assuming it's missing and appending."
                     );
                     prefabPath += ".prefab";
@@ -331,7 +200,7 @@ namespace MCPForUnity.Editor.Tools
                         if (newGo == null)
                         {
                             // This might happen if the asset exists but isn't a valid GameObject prefab somehow
-                            Debug.LogError(
+                            McpLog.Error(
                                 $"[ManageGameObject.Create] Failed to instantiate prefab at '{prefabPath}', asset might be corrupted or not a GameObject."
                             );
                             return new ErrorResponse(
@@ -348,7 +217,7 @@ namespace MCPForUnity.Editor.Tools
                             newGo,
                             $"Instantiate Prefab '{prefabAsset.name}' as '{newGo.name}'"
                         );
-                        Debug.Log(
+                        McpLog.Info(
                             $"[ManageGameObject.Create] Instantiated prefab '{prefabAsset.name}' from path '{prefabPath}' as '{newGo.name}'."
                         );
                     }
@@ -363,7 +232,7 @@ namespace MCPForUnity.Editor.Tools
                 {
                     // Only return error if prefabPath was specified but not found.
                     // If prefabPath was empty/null, we proceed to create primitive/empty.
-                    Debug.LogWarning(
+                    McpLog.Warn(
                         $"[ManageGameObject.Create] Prefab asset not found at path: '{prefabPath}'. Will proceed to create new object if specified."
                     );
                     // Do not return error here, allow fallback to primitive/empty creation
@@ -465,42 +334,29 @@ namespace MCPForUnity.Editor.Tools
             // Set Tag (added for create action)
             if (!string.IsNullOrEmpty(tag))
             {
-                // Similar logic as in ModifyGameObject for setting/creating tags
-                string tagToSet = string.IsNullOrEmpty(tag) ? "Untagged" : tag;
-                try
+                // Check if tag exists first (Unity doesn't throw exceptions for undefined tags, just logs a warning)
+                if (tag != "Untagged" && !System.Linq.Enumerable.Contains(InternalEditorUtility.tags, tag))
                 {
-                    newGo.tag = tagToSet;
-                }
-                catch (UnityException ex)
-                {
-                    if (ex.Message.Contains("is not defined"))
+                    McpLog.Info($"[ManageGameObject.Create] Tag '{tag}' not found. Creating it.");
+                    try
                     {
-                        Debug.LogWarning(
-                            $"[ManageGameObject.Create] Tag '{tagToSet}' not found. Attempting to create it."
-                        );
-                        try
-                        {
-                            InternalEditorUtility.AddTag(tagToSet);
-                            newGo.tag = tagToSet; // Retry
-                            Debug.Log(
-                                $"[ManageGameObject.Create] Tag '{tagToSet}' created and assigned successfully."
-                            );
-                        }
-                        catch (Exception innerEx)
-                        {
-                            UnityEngine.Object.DestroyImmediate(newGo); // Clean up
-                            return new ErrorResponse(
-                                $"Failed to create or assign tag '{tagToSet}' during creation: {innerEx.Message}."
-                            );
-                        }
+                        InternalEditorUtility.AddTag(tag);
                     }
-                    else
+                    catch (Exception ex)
                     {
                         UnityEngine.Object.DestroyImmediate(newGo); // Clean up
-                        return new ErrorResponse(
-                            $"Failed to set tag to '{tagToSet}' during creation: {ex.Message}."
-                        );
+                        return new ErrorResponse($"Failed to create tag '{tag}': {ex.Message}.");
                     }
+                }
+                
+                try
+                {
+                    newGo.tag = tag;
+                }
+                catch (Exception ex)
+                {
+                    UnityEngine.Object.DestroyImmediate(newGo); // Clean up
+                    return new ErrorResponse($"Failed to set tag to '{tag}' during creation: {ex.Message}.");
                 }
             }
 
@@ -515,7 +371,7 @@ namespace MCPForUnity.Editor.Tools
                 }
                 else
                 {
-                    Debug.LogWarning(
+                    McpLog.Warn(
                         $"[ManageGameObject.Create] Layer '{layerName}' not found. Using default layer."
                     );
                 }
@@ -550,7 +406,7 @@ namespace MCPForUnity.Editor.Tools
                     }
                     else
                     {
-                        Debug.LogWarning(
+                        McpLog.Warn(
                             $"[ManageGameObject] Invalid component format in componentsToAdd: {compToken}"
                         );
                     }
@@ -574,7 +430,7 @@ namespace MCPForUnity.Editor.Tools
                 // Ensure the *saving* path ends with .prefab
                 if (!finalPrefabPath.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
                 {
-                    Debug.Log(
+                    McpLog.Info(
                         $"[ManageGameObject.Create] Appending .prefab extension to save path: '{finalPrefabPath}' -> '{finalPrefabPath}.prefab'"
                     );
                     finalPrefabPath += ".prefab";
@@ -590,8 +446,8 @@ namespace MCPForUnity.Editor.Tools
                     )
                     {
                         System.IO.Directory.CreateDirectory(directoryPath);
-                        AssetDatabase.Refresh(); // Refresh asset database to recognize the new folder
-                        Debug.Log(
+                        AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport); // Refresh asset database to recognize the new folder
+                        McpLog.Info(
                             $"[ManageGameObject.Create] Created directory for prefab: {directoryPath}"
                         );
                     }
@@ -610,7 +466,7 @@ namespace MCPForUnity.Editor.Tools
                             $"Failed to save GameObject '{name}' as prefab at '{finalPrefabPath}'. Check path and permissions."
                         );
                     }
-                    Debug.Log(
+                    McpLog.Info(
                         $"[ManageGameObject.Create] GameObject '{name}' saved as prefab to '{finalPrefabPath}' and instance connected."
                     );
                     // Mark the new prefab asset as dirty? Not usually necessary, SaveAsPrefabAsset handles it.
@@ -733,49 +589,29 @@ namespace MCPForUnity.Editor.Tools
             {
                 // Ensure the tag is not empty, if empty, it means "Untagged" implicitly
                 string tagToSet = string.IsNullOrEmpty(tag) ? "Untagged" : tag;
+                
+                // Check if tag exists first (Unity doesn't throw exceptions for undefined tags, just logs a warning)
+                if (tagToSet != "Untagged" && !System.Linq.Enumerable.Contains(InternalEditorUtility.tags, tagToSet))
+                {
+                    McpLog.Info($"[ManageGameObject] Tag '{tagToSet}' not found. Creating it.");
+                    try
+                    {
+                        InternalEditorUtility.AddTag(tagToSet);
+                    }
+                    catch (Exception ex)
+                    {
+                        return new ErrorResponse($"Failed to create tag '{tagToSet}': {ex.Message}.");
+                    }
+                }
+                
                 try
                 {
                     targetGo.tag = tagToSet;
                     modified = true;
                 }
-                catch (UnityException ex)
+                catch (Exception ex)
                 {
-                    // Check if the error is specifically because the tag doesn't exist
-                    if (ex.Message.Contains("is not defined"))
-                    {
-                        Debug.LogWarning(
-                            $"[ManageGameObject] Tag '{tagToSet}' not found. Attempting to create it."
-                        );
-                        try
-                        {
-                            // Attempt to create the tag using internal utility
-                            InternalEditorUtility.AddTag(tagToSet);
-                            // Wait a frame maybe? Not strictly necessary but sometimes helps editor updates.
-                            // yield return null; // Cannot yield here, editor script limitation
-
-                            // Retry setting the tag immediately after creation
-                            targetGo.tag = tagToSet;
-                            modified = true;
-                            Debug.Log(
-                                $"[ManageGameObject] Tag '{tagToSet}' created and assigned successfully."
-                            );
-                        }
-                        catch (Exception innerEx)
-                        {
-                            // Handle failure during tag creation or the second assignment attempt
-                            Debug.LogError(
-                                $"[ManageGameObject] Failed to create or assign tag '{tagToSet}' after attempting creation: {innerEx.Message}"
-                            );
-                            return new ErrorResponse(
-                                $"Failed to create or assign tag '{tagToSet}': {innerEx.Message}. Check Tag Manager and permissions."
-                            );
-                        }
-                    }
-                    else
-                    {
-                        // If the exception was for a different reason, return the original error
-                        return new ErrorResponse($"Failed to set tag to '{tagToSet}': {ex.Message}.");
-                    }
+                    return new ErrorResponse($"Failed to set tag to '{tagToSet}': {ex.Message}.");
                 }
             }
 
@@ -1014,7 +850,7 @@ namespace MCPForUnity.Editor.Tools
                     }
                     else
                     {
-                        Debug.LogWarning($"[ManageGameObject.Duplicate] Parent '{parentToken}' not found. Keeping original parent.");
+                        McpLog.Warn($"[ManageGameObject.Duplicate] Parent '{parentToken}' not found. Keeping original parent.");
                     }
                 }
             }
@@ -1140,7 +976,7 @@ namespace MCPForUnity.Editor.Tools
                     case "forward": case "front": return Vector3.forward;
                     case "back": case "backward": case "behind": return Vector3.back;
                     default:
-                        Debug.LogWarning($"[ManageGameObject.MoveRelative] Unknown direction '{direction}', defaulting to forward.");
+                        McpLog.Warn($"[ManageGameObject.MoveRelative] Unknown direction '{direction}', defaulting to forward.");
                         return Vector3.forward;
                 }
             }
@@ -1156,7 +992,7 @@ namespace MCPForUnity.Editor.Tools
                     case "forward": case "front": return referenceTransform.forward;
                     case "back": case "backward": case "behind": return -referenceTransform.forward;
                     default:
-                        Debug.LogWarning($"[ManageGameObject.MoveRelative] Unknown direction '{direction}', defaulting to forward.");
+                        McpLog.Warn($"[ManageGameObject.MoveRelative] Unknown direction '{direction}', defaulting to forward.");
                         return referenceTransform.forward;
                 }
             }
@@ -1202,381 +1038,6 @@ namespace MCPForUnity.Editor.Tools
             }
         }
 
-        private static object FindGameObjects(
-            JObject @params,
-            JToken targetToken,
-            string searchMethod
-        )
-        {
-            bool findAll = @params["findAll"]?.ToObject<bool>() ?? false;
-            List<GameObject> foundObjects = FindObjectsInternal(
-                targetToken,
-                searchMethod,
-                findAll,
-                @params
-            );
-
-            if (foundObjects.Count == 0)
-            {
-                return new SuccessResponse("No matching GameObjects found.", new List<object>());
-            }
-
-            // Use the new serializer helper
-            //var results = foundObjects.Select(go => GetGameObjectData(go)).ToList();
-            var results = foundObjects.Select(go => Helpers.GameObjectSerializer.GetGameObjectData(go)).ToList();
-            return new SuccessResponse($"Found {results.Count} GameObject(s).", results);
-        }
-
-        private static object GetComponentsFromTarget(
-            string target,
-            string searchMethod,
-            bool includeNonPublicSerialized = true,
-            int pageSize = 25,
-            int cursor = 0,
-            int maxComponents = 50,
-            bool includeProperties = false
-        )
-        {
-            GameObject targetGo = FindObjectInternal(target, searchMethod);
-            if (targetGo == null)
-            {
-                return new ErrorResponse(
-                    $"Target GameObject ('{target}') not found using method '{searchMethod ?? "default"}'."
-                );
-            }
-
-            try
-            {
-                int resolvedPageSize = Mathf.Clamp(pageSize, 1, 200);
-                int resolvedCursor = Mathf.Max(0, cursor);
-                int resolvedMaxComponents = Mathf.Clamp(maxComponents, 1, 500);
-                int effectiveTake = Mathf.Min(resolvedPageSize, resolvedMaxComponents);
-
-                // Build a stable list once; pagination is applied to this list.
-                var all = targetGo.GetComponents<Component>();
-                var components = new List<Component>(all?.Length ?? 0);
-                if (all != null)
-                {
-                    for (int i = 0; i < all.Length; i++)
-                    {
-                        if (all[i] != null) components.Add(all[i]);
-                    }
-                }
-
-                int total = components.Count;
-                if (resolvedCursor > total) resolvedCursor = total;
-                int end = Mathf.Min(total, resolvedCursor + effectiveTake);
-
-                var items = new List<object>(Mathf.Max(0, end - resolvedCursor));
-
-                // If caller explicitly asked for properties, we still enforce a conservative payload budget.
-                const int maxPayloadChars = 250_000; // ~250KB assuming 1 char ~= 1 byte ASCII-ish
-                int payloadChars = 0;
-
-                for (int i = resolvedCursor; i < end; i++)
-                {
-                    var c = components[i];
-                    if (c == null) continue;
-
-                    if (!includeProperties)
-                    {
-                        items.Add(BuildComponentMetadata(c));
-                        continue;
-                    }
-
-                    try
-                    {
-                        var data = Helpers.GameObjectSerializer.GetComponentData(c, includeNonPublicSerialized);
-                        if (data == null) continue;
-
-                        // Rough cap to keep responses from exploding even when includeProperties is true.
-                        var token = JToken.FromObject(data);
-                        int addChars = token.ToString(Newtonsoft.Json.Formatting.None).Length;
-                        if (payloadChars + addChars > maxPayloadChars && items.Count > 0)
-                        {
-                            // Stop early; next_cursor will allow fetching more (or caller can use get_component).
-                            end = i;
-                            break;
-                        }
-                        payloadChars += addChars;
-                        items.Add(token);
-                    }
-                    catch (Exception ex)
-                    {
-                        // Avoid throwing; mark the component as failed.
-                        items.Add(
-                            new JObject(
-                                new JProperty("typeName", c.GetType().FullName + " (Serialization Error)"),
-                                new JProperty("instanceID", c.GetInstanceID()),
-                                new JProperty("error", ex.Message)
-                            )
-                        );
-                    }
-                }
-
-                bool truncated = end < total;
-                string nextCursor = truncated ? end.ToString() : null;
-
-                var payload = new
-                {
-                    cursor = resolvedCursor,
-                    pageSize = effectiveTake,
-                    next_cursor = nextCursor,
-                    truncated = truncated,
-                    total = total,
-                    includeProperties = includeProperties,
-                    items = items,
-                };
-
-                return new SuccessResponse(
-                    $"Retrieved components page from '{targetGo.name}'.",
-                    payload
-                );
-            }
-            catch (Exception e)
-            {
-                return new ErrorResponse(
-                    $"Error getting components from '{targetGo.name}': {e.Message}"
-                );
-            }
-        }
-
-        private static object BuildComponentMetadata(Component c)
-        {
-            if (c == null) return null;
-            var d = new Dictionary<string, object>
-            {
-                { "typeName", c.GetType().FullName },
-                { "instanceID", c.GetInstanceID() },
-            };
-            if (c is Behaviour b)
-            {
-                d["enabled"] = b.enabled;
-            }
-            return d;
-        }
-
-        private static object GetSingleComponentFromTarget(string target, string searchMethod, string componentName, bool includeNonPublicSerialized = true)
-        {
-            GameObject targetGo = FindObjectInternal(target, searchMethod);
-            if (targetGo == null)
-            {
-                return new ErrorResponse(
-                    $"Target GameObject ('{target}') not found using method '{searchMethod ?? "default"}'."
-                );
-            }
-
-            try
-            {
-                // Try to find the component by name
-                Component targetComponent = targetGo.GetComponent(componentName);
-
-                // If not found directly, try to find by type name (handle namespaces)
-                if (targetComponent == null)
-                {
-                    Component[] allComponents = targetGo.GetComponents<Component>();
-                    foreach (Component comp in allComponents)
-                    {
-                        if (comp != null)
-                        {
-                            string typeName = comp.GetType().Name;
-                            string fullTypeName = comp.GetType().FullName;
-
-                            if (typeName == componentName || fullTypeName == componentName)
-                            {
-                                targetComponent = comp;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if (targetComponent == null)
-                {
-                    return new ErrorResponse(
-                        $"Component '{componentName}' not found on GameObject '{targetGo.name}'."
-                    );
-                }
-
-                var componentData = Helpers.GameObjectSerializer.GetComponentData(targetComponent, includeNonPublicSerialized);
-
-                if (componentData == null)
-                {
-                    return new ErrorResponse(
-                        $"Failed to serialize component '{componentName}' on GameObject '{targetGo.name}'."
-                    );
-                }
-
-                return new SuccessResponse(
-                    $"Retrieved component '{componentName}' from '{targetGo.name}'.",
-                    componentData
-                );
-            }
-            catch (Exception e)
-            {
-                return new ErrorResponse(
-                    $"Error getting component '{componentName}' from '{targetGo.name}': {e.Message}"
-                );
-            }
-        }
-
-        private static object AddComponentToTarget(
-            JObject @params,
-            JToken targetToken,
-            string searchMethod
-        )
-        {
-            GameObject targetGo = FindObjectInternal(targetToken, searchMethod);
-            if (targetGo == null)
-            {
-                return new ErrorResponse(
-                    $"Target GameObject ('{targetToken}') not found using method '{searchMethod ?? "default"}'."
-                );
-            }
-
-            string typeName = null;
-            JObject properties = null;
-
-            // Allow adding component specified directly or via componentsToAdd array (take first)
-            if (@params["componentName"] != null)
-            {
-                typeName = @params["componentName"]?.ToString();
-                properties = @params["componentProperties"]?[typeName] as JObject; // Check if props are nested under name
-            }
-            else if (
-                @params["componentsToAdd"] is JArray componentsToAddArray
-                && componentsToAddArray.Count > 0
-            )
-            {
-                var compToken = componentsToAddArray.First;
-                if (compToken.Type == JTokenType.String)
-                {
-                    typeName = compToken.ToString();
-                    // Check for properties in top-level componentProperties parameter
-                    properties = @params["componentProperties"]?[typeName] as JObject;
-                }
-                else if (compToken is JObject compObj)
-                {
-                    typeName = compObj["typeName"]?.ToString();
-                    properties = compObj["properties"] as JObject;
-                }
-            }
-
-            if (string.IsNullOrEmpty(typeName))
-            {
-                return new ErrorResponse(
-                    "Component type name ('componentName' or first element in 'componentsToAdd') is required."
-                );
-            }
-
-            var addResult = AddComponentInternal(targetGo, typeName, properties);
-            if (addResult != null)
-                return addResult; // Return error
-
-            EditorUtility.SetDirty(targetGo);
-            // Use the new serializer helper
-            return new SuccessResponse(
-                $"Component '{typeName}' added to '{targetGo.name}'.",
-                Helpers.GameObjectSerializer.GetGameObjectData(targetGo)
-            ); // Return updated GO data
-        }
-
-        private static object RemoveComponentFromTarget(
-            JObject @params,
-            JToken targetToken,
-            string searchMethod
-        )
-        {
-            GameObject targetGo = FindObjectInternal(targetToken, searchMethod);
-            if (targetGo == null)
-            {
-                return new ErrorResponse(
-                    $"Target GameObject ('{targetToken}') not found using method '{searchMethod ?? "default"}'."
-                );
-            }
-
-            string typeName = null;
-            // Allow removing component specified directly or via componentsToRemove array (take first)
-            if (@params["componentName"] != null)
-            {
-                typeName = @params["componentName"]?.ToString();
-            }
-            else if (
-                @params["componentsToRemove"] is JArray componentsToRemoveArray
-                && componentsToRemoveArray.Count > 0
-            )
-            {
-                typeName = componentsToRemoveArray.First?.ToString();
-            }
-
-            if (string.IsNullOrEmpty(typeName))
-            {
-                return new ErrorResponse(
-                    "Component type name ('componentName' or first element in 'componentsToRemove') is required."
-                );
-            }
-
-            var removeResult = RemoveComponentInternal(targetGo, typeName);
-            if (removeResult != null)
-                return removeResult; // Return error
-
-            EditorUtility.SetDirty(targetGo);
-            // Use the new serializer helper
-            return new SuccessResponse(
-                $"Component '{typeName}' removed from '{targetGo.name}'.",
-                Helpers.GameObjectSerializer.GetGameObjectData(targetGo)
-            );
-        }
-
-        private static object SetComponentPropertyOnTarget(
-            JObject @params,
-            JToken targetToken,
-            string searchMethod
-        )
-        {
-            GameObject targetGo = FindObjectInternal(targetToken, searchMethod);
-            if (targetGo == null)
-            {
-                return new ErrorResponse(
-                    $"Target GameObject ('{targetToken}') not found using method '{searchMethod ?? "default"}'."
-                );
-            }
-
-            string compName = @params["componentName"]?.ToString();
-            JObject propertiesToSet = null;
-
-            if (!string.IsNullOrEmpty(compName))
-            {
-                // Properties might be directly under componentProperties or nested under the component name
-                if (@params["componentProperties"] is JObject compProps)
-                {
-                    propertiesToSet = compProps[compName] as JObject ?? compProps; // Allow flat or nested structure
-                }
-            }
-            else
-            {
-                return new ErrorResponse("'componentName' parameter is required.");
-            }
-
-            if (propertiesToSet == null || !propertiesToSet.HasValues)
-            {
-                return new ErrorResponse(
-                    "'componentProperties' dictionary for the specified component is required and cannot be empty."
-                );
-            }
-
-            var setResult = SetComponentPropertiesInternal(targetGo, compName, propertiesToSet);
-            if (setResult != null)
-                return setResult; // Return error
-
-            EditorUtility.SetDirty(targetGo);
-            // Use the new serializer helper
-            return new SuccessResponse(
-                $"Properties set for component '{compName}' on '{targetGo.name}'.",
-                Helpers.GameObjectSerializer.GetGameObjectData(targetGo)
-            );
-        }
-
         // --- Internal Helpers ---
 
         /// <summary>
@@ -1596,7 +1057,7 @@ namespace MCPForUnity.Editor.Tools
                 }
                 catch (Exception ex)
                 {
-                    Debug.LogWarning($"Failed to parse JArray as Vector3: {array}. Error: {ex.Message}");
+                    McpLog.Warn($"Failed to parse JArray as Vector3: {array}. Error: {ex.Message}");
                 }
             }
             return null;
@@ -1663,7 +1124,7 @@ namespace MCPForUnity.Editor.Tools
                 rootSearchObject = FindObjectInternal(targetToken, "by_id_or_name_or_path"); // Find the root for child search
                 if (rootSearchObject == null)
                 {
-                    Debug.LogWarning(
+                    McpLog.Warn(
                         $"[ManageGameObject.Find] Root object '{targetToken}' for child search not found."
                     );
                     return results; // Return empty if root not found
@@ -1730,27 +1191,25 @@ namespace MCPForUnity.Editor.Tools
                     Type componentType = FindType(searchTerm);
                     if (componentType != null)
                     {
-                        // Determine FindObjectsInactive based on the searchInactive flag
-                        FindObjectsInactive findInactive = searchInactive
-                            ? FindObjectsInactive.Include
-                            : FindObjectsInactive.Exclude;
-                        // Replace FindObjectsOfType with FindObjectsByType, specifying the sorting mode and inactive state
-                        var searchPoolComp = rootSearchObject
-                            ? rootSearchObject
+                        IEnumerable<GameObject> searchPoolComp;
+                        if (rootSearchObject)
+                        {
+                            searchPoolComp = rootSearchObject
                                 .GetComponentsInChildren(componentType, searchInactive)
-                                .Select(c => (c as Component).gameObject)
-                            : UnityEngine
-                                .Object.FindObjectsByType(
-                                    componentType,
-                                    findInactive,
-                                    FindObjectsSortMode.None
-                                )
                                 .Select(c => (c as Component).gameObject);
+                        }
+                        else
+                        {
+                            // Use FindObjectsOfType overload that respects includeInactive
+                            searchPoolComp = UnityEngine.Object.FindObjectsOfType(componentType, searchInactive)
+                                .Cast<Component>()
+                                .Select(c => c.gameObject);
+                        }
                         results.AddRange(searchPoolComp.Where(go => go != null)); // Ensure GO is valid
                     }
                     else
                     {
-                        Debug.LogWarning(
+                        McpLog.Warn(
                             $"[ManageGameObject.Find] Component type not found: {searchTerm}"
                         );
                     }
@@ -1779,7 +1238,7 @@ namespace MCPForUnity.Editor.Tools
                     results.AddRange(allObjectsName.Where(go => go.name == searchTerm));
                     break;
                 default:
-                    Debug.LogWarning(
+                    McpLog.Warn(
                         $"[ManageGameObject.Find] Unknown search method: {searchMethod}"
                     );
                     break;
@@ -2028,17 +1487,17 @@ namespace MCPForUnity.Editor.Tools
                     if (!setResult)
                     {
                         var availableProperties = ComponentResolver.GetAllComponentProperties(targetComponent.GetType());
-                        var suggestions = ComponentResolver.GetAIPropertySuggestions(propName, availableProperties);
+                        var suggestions = ComponentResolver.GetFuzzyPropertySuggestions(propName, availableProperties);
                         var msg = suggestions.Any()
                             ? $"Property '{propName}' not found. Did you mean: {string.Join(", ", suggestions)}? Available: [{string.Join(", ", availableProperties)}]"
                             : $"Property '{propName}' not found. Available: [{string.Join(", ", availableProperties)}]";
-                        Debug.LogWarning($"[ManageGameObject] {msg}");
+                        McpLog.Warn($"[ManageGameObject] {msg}");
                         failures.Add(msg);
                     }
                 }
                 catch (Exception e)
                 {
-                    Debug.LogError(
+                    McpLog.Error(
                         $"[ManageGameObject] Error setting property '{propName}' on '{compName}': {e.Message}"
                     );
                     failures.Add($"Error setting '{propName}': {e.Message}");
@@ -2059,6 +1518,9 @@ namespace MCPForUnity.Editor.Tools
             BindingFlags flags =
                 BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase;
 
+            // Normalize property name: "Use Gravity" → "useGravity", "is_kinematic" → "isKinematic"
+            string normalizedName = Helpers.ParamCoercion.NormalizePropertyName(memberName);
+
             // Use shared serializer to avoid per-call allocation
             var inputSerializer = InputSerializer;
 
@@ -2072,7 +1534,9 @@ namespace MCPForUnity.Editor.Tools
                     return SetNestedProperty(target, memberName, value, inputSerializer);
                 }
 
-                PropertyInfo propInfo = type.GetProperty(memberName, flags);
+                // Try both original and normalized names
+                PropertyInfo propInfo = type.GetProperty(memberName, flags) 
+                                     ?? type.GetProperty(normalizedName, flags);
                 if (propInfo != null && propInfo.CanWrite)
                 {
                     // Use the inputSerializer for conversion
@@ -2084,12 +1548,14 @@ namespace MCPForUnity.Editor.Tools
                     }
                     else
                     {
-                        Debug.LogWarning($"[SetProperty] Conversion failed for property '{memberName}' (Type: {propInfo.PropertyType.Name}) from token: {value.ToString(Formatting.None)}");
+                        McpLog.Warn($"[SetProperty] Conversion failed for property '{memberName}' (Type: {propInfo.PropertyType.Name}) from token: {value.ToString(Formatting.None)}");
                     }
                 }
                 else
                 {
-                    FieldInfo fieldInfo = type.GetField(memberName, flags);
+                    // Try both original and normalized names for fields
+                    FieldInfo fieldInfo = type.GetField(memberName, flags) 
+                                       ?? type.GetField(normalizedName, flags);
                     if (fieldInfo != null) // Check if !IsLiteral?
                     {
                         // Use the inputSerializer for conversion
@@ -2101,13 +1567,14 @@ namespace MCPForUnity.Editor.Tools
                         }
                         else
                         {
-                            Debug.LogWarning($"[SetProperty] Conversion failed for field '{memberName}' (Type: {fieldInfo.FieldType.Name}) from token: {value.ToString(Formatting.None)}");
+                            McpLog.Warn($"[SetProperty] Conversion failed for field '{memberName}' (Type: {fieldInfo.FieldType.Name}) from token: {value.ToString(Formatting.None)}");
                         }
                     }
                     else
                     {
-                        // Try NonPublic [SerializeField] fields
-                        var npField = type.GetField(memberName, BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.IgnoreCase);
+                        // Try NonPublic [SerializeField] fields (with both original and normalized names)
+                        var npField = type.GetField(memberName, BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.IgnoreCase)
+                                   ?? type.GetField(normalizedName, BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.IgnoreCase);
                         if (npField != null && npField.GetCustomAttribute<SerializeField>() != null)
                         {
                             object convertedValue = ConvertJTokenToType(value, npField.FieldType, inputSerializer);
@@ -2122,7 +1589,7 @@ namespace MCPForUnity.Editor.Tools
             }
             catch (Exception ex)
             {
-                Debug.LogError(
+                McpLog.Error(
                     $"[SetProperty] Failed to set '{memberName}' on {type.Name}: {ex.Message}\nToken: {value.ToString(Formatting.None)}"
                 );
             }
@@ -2181,7 +1648,7 @@ namespace MCPForUnity.Editor.Tools
                         fieldInfo = currentType.GetField(part, flags);
                         if (fieldInfo == null)
                         {
-                            Debug.LogWarning(
+                            McpLog.Warn(
                                 $"[SetNestedProperty] Could not find property or field '{part}' on type '{currentType.Name}'"
                             );
                             return false;
@@ -2196,7 +1663,7 @@ namespace MCPForUnity.Editor.Tools
                     //Need to stop if current property is null
                     if (currentObject == null)
                     {
-                        Debug.LogWarning(
+                        McpLog.Warn(
                             $"[SetNestedProperty] Property '{part}' is null, cannot access nested properties."
                         );
                         return false;
@@ -2209,7 +1676,7 @@ namespace MCPForUnity.Editor.Tools
                             var materials = currentObject as Material[];
                             if (arrayIndex < 0 || arrayIndex >= materials.Length)
                             {
-                                Debug.LogWarning(
+                                McpLog.Warn(
                                     $"[SetNestedProperty] Material index {arrayIndex} out of range (0-{materials.Length - 1})"
                                 );
                                 return false;
@@ -2221,7 +1688,7 @@ namespace MCPForUnity.Editor.Tools
                             var list = currentObject as System.Collections.IList;
                             if (arrayIndex < 0 || arrayIndex >= list.Count)
                             {
-                                Debug.LogWarning(
+                                McpLog.Warn(
                                     $"[SetNestedProperty] Index {arrayIndex} out of range (0-{list.Count - 1})"
                                 );
                                 return false;
@@ -2230,7 +1697,7 @@ namespace MCPForUnity.Editor.Tools
                         }
                         else
                         {
-                            Debug.LogWarning(
+                            McpLog.Warn(
                                 $"[SetNestedProperty] Property '{part}' is not an array or list, cannot access by index."
                             );
                             return false;
@@ -2261,7 +1728,7 @@ namespace MCPForUnity.Editor.Tools
                     }
                     else
                     {
-                        Debug.LogWarning($"[SetNestedProperty] Final conversion failed for property '{finalPart}' (Type: {finalPropInfo.PropertyType.Name}) from token: {value.ToString(Formatting.None)}");
+                        McpLog.Warn($"[SetNestedProperty] Final conversion failed for property '{finalPart}' (Type: {finalPropInfo.PropertyType.Name}) from token: {value.ToString(Formatting.None)}");
                     }
                 }
                 else
@@ -2278,12 +1745,12 @@ namespace MCPForUnity.Editor.Tools
                         }
                         else
                         {
-                            Debug.LogWarning($"[SetNestedProperty] Final conversion failed for field '{finalPart}' (Type: {finalFieldInfo.FieldType.Name}) from token: {value.ToString(Formatting.None)}");
+                            McpLog.Warn($"[SetNestedProperty] Final conversion failed for field '{finalPart}' (Type: {finalFieldInfo.FieldType.Name}) from token: {value.ToString(Formatting.None)}");
                         }
                     }
                     else
                     {
-                        Debug.LogWarning(
+                        McpLog.Warn(
                             $"[SetNestedProperty] Could not find final writable property or field '{finalPart}' on type '{currentType.Name}'"
                         );
                     }
@@ -2291,7 +1758,7 @@ namespace MCPForUnity.Editor.Tools
             }
             catch (Exception ex)
             {
-                Debug.LogError(
+                McpLog.Error(
                     $"[SetNestedProperty] Error setting nested property '{path}': {ex.Message}\nToken: {value.ToString(Formatting.None)}"
                 );
             }
@@ -2339,45 +1806,14 @@ namespace MCPForUnity.Editor.Tools
         /// <summary>
         /// Simple JToken to Type conversion for common Unity types, using JsonSerializer.
         /// </summary>
-         // Pass the input serializer
+        /// <remarks>
+        /// Delegates to PropertyConversion.ConvertToType for unified type handling.
+        /// The inputSerializer parameter is kept for backwards compatibility but is ignored
+        /// as PropertyConversion uses UnityJsonSerializer.Instance internally.
+        /// </remarks>
         private static object ConvertJTokenToType(JToken token, Type targetType, JsonSerializer inputSerializer)
         {
-            if (token == null || token.Type == JTokenType.Null)
-            {
-                if (targetType.IsValueType && Nullable.GetUnderlyingType(targetType) == null)
-                {
-                    Debug.LogWarning($"Cannot assign null to non-nullable value type {targetType.Name}. Returning default value.");
-                    return Activator.CreateInstance(targetType);
-                }
-                return null;
-            }
-
-            try
-            {
-                // Use the provided serializer instance which includes our custom converters
-                return token.ToObject(targetType, inputSerializer);
-            }
-            catch (JsonSerializationException jsonEx)
-            {
-                Debug.LogError($"JSON Deserialization Error converting token to {targetType.FullName}: {jsonEx.Message}\nToken: {token.ToString(Formatting.None)}");
-                // Optionally re-throw or return null/default
-                // return targetType.IsValueType ? Activator.CreateInstance(targetType) : null;
-                throw; // Re-throw to indicate failure higher up
-            }
-            catch (ArgumentException argEx)
-            {
-                Debug.LogError($"Argument Error converting token to {targetType.FullName}: {argEx.Message}\nToken: {token.ToString(Formatting.None)}");
-                throw;
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"Unexpected error converting token to {targetType.FullName}: {ex}\nToken: {token.ToString(Formatting.None)}");
-                throw;
-            }
-            // If ToObject succeeded, it would have returned. If it threw, we wouldn't reach here.
-            // This fallback logic is likely unreachable if ToObject covers all cases or throws on failure.
-            // Debug.LogWarning($"Conversion failed for token to {targetType.FullName}. Token: {token.ToString(Formatting.None)}");
-            // return targetType.IsValueType ? Activator.CreateInstance(targetType) : null;
+            return PropertyConversion.ConvertToType(token, targetType);
         }
 
         // --- ParseJTokenTo... helpers are likely redundant now with the serializer approach ---
@@ -2395,7 +1831,7 @@ namespace MCPForUnity.Editor.Tools
             {
                 return new Vector3(arr[0].ToObject<float>(), arr[1].ToObject<float>(), arr[2].ToObject<float>());
             }
-            Debug.LogWarning($"Could not parse JToken '{token}' as Vector3 using fallback. Returning Vector3.zero.");
+            McpLog.Warn($"Could not parse JToken '{token}' as Vector3 using fallback. Returning Vector3.zero.");
             return Vector3.zero;
 
         }
@@ -2410,7 +1846,7 @@ namespace MCPForUnity.Editor.Tools
             {
                 return new Vector2(arr[0].ToObject<float>(), arr[1].ToObject<float>());
             }
-            Debug.LogWarning($"Could not parse JToken '{token}' as Vector2 using fallback. Returning Vector2.zero.");
+            McpLog.Warn($"Could not parse JToken '{token}' as Vector2 using fallback. Returning Vector2.zero.");
             return Vector2.zero;
         }
         private static Quaternion ParseJTokenToQuaternion(JToken token)
@@ -2424,7 +1860,7 @@ namespace MCPForUnity.Editor.Tools
             {
                 return new Quaternion(arr[0].ToObject<float>(), arr[1].ToObject<float>(), arr[2].ToObject<float>(), arr[3].ToObject<float>());
             }
-            Debug.LogWarning($"Could not parse JToken '{token}' as Quaternion using fallback. Returning Quaternion.identity.");
+            McpLog.Warn($"Could not parse JToken '{token}' as Quaternion using fallback. Returning Quaternion.identity.");
             return Quaternion.identity;
         }
         private static Color ParseJTokenToColor(JToken token)
@@ -2438,7 +1874,7 @@ namespace MCPForUnity.Editor.Tools
             {
                 return new Color(arr[0].ToObject<float>(), arr[1].ToObject<float>(), arr[2].ToObject<float>(), arr[3].ToObject<float>());
             }
-            Debug.LogWarning($"Could not parse JToken '{token}' as Color using fallback. Returning Color.white.");
+            McpLog.Warn($"Could not parse JToken '{token}' as Color using fallback. Returning Color.white.");
             return Color.white;
         }
         private static Rect ParseJTokenToRect(JToken token)
@@ -2452,7 +1888,7 @@ namespace MCPForUnity.Editor.Tools
             {
                 return new Rect(arr[0].ToObject<float>(), arr[1].ToObject<float>(), arr[2].ToObject<float>(), arr[3].ToObject<float>());
             }
-            Debug.LogWarning($"Could not parse JToken '{token}' as Rect using fallback. Returning Rect.zero.");
+            McpLog.Warn($"Could not parse JToken '{token}' as Rect using fallback. Returning Rect.zero.");
             return Rect.zero;
         }
         private static Bounds ParseJTokenToBounds(JToken token)
@@ -2470,7 +1906,7 @@ namespace MCPForUnity.Editor.Tools
             // {
             //      return new Bounds(new Vector3(arr[0].ToObject<float>(), arr[1].ToObject<float>(), arr[2].ToObject<float>()), new Vector3(arr[3].ToObject<float>(), arr[4].ToObject<float>(), arr[5].ToObject<float>()));
             // }
-            Debug.LogWarning($"Could not parse JToken '{token}' as Bounds using fallback. Returning new Bounds(Vector3.zero, Vector3.zero).");
+            McpLog.Warn($"Could not parse JToken '{token}' as Bounds using fallback. Returning new Bounds(Vector3.zero, Vector3.zero).");
             return new Bounds(Vector3.zero, Vector3.zero);
         }
         // --- End Redundant Parse Helpers ---
@@ -2479,104 +1915,13 @@ namespace MCPForUnity.Editor.Tools
         /// Finds a specific UnityEngine.Object based on a find instruction JObject.
         /// Primarily used by UnityEngineObjectConverter during deserialization.
         /// </summary>
-        // Made public static so UnityEngineObjectConverter can call it. Moved from ConvertJTokenToType.
+        /// <remarks>
+        /// This method now delegates to ObjectResolver.Resolve() for cleaner architecture.
+        /// Kept for backwards compatibility with existing code.
+        /// </remarks>
         public static UnityEngine.Object FindObjectByInstruction(JObject instruction, Type targetType)
         {
-            string findTerm = instruction["find"]?.ToString();
-            string method = instruction["method"]?.ToString()?.ToLower();
-            string componentName = instruction["component"]?.ToString(); // Specific component to get
-
-            if (string.IsNullOrEmpty(findTerm))
-            {
-                Debug.LogWarning("Find instruction missing 'find' term.");
-                return null;
-            }
-
-            // Use a flexible default search method if none provided
-            string searchMethodToUse = string.IsNullOrEmpty(method) ? "by_id_or_name_or_path" : method;
-
-            // If the target is an asset (Material, Texture, ScriptableObject etc.) try AssetDatabase first
-            if (typeof(Material).IsAssignableFrom(targetType) ||
-                typeof(Texture).IsAssignableFrom(targetType) ||
-                typeof(ScriptableObject).IsAssignableFrom(targetType) ||
-                targetType.FullName.StartsWith("UnityEngine.U2D") || // Sprites etc.
-                typeof(AudioClip).IsAssignableFrom(targetType) ||
-                typeof(AnimationClip).IsAssignableFrom(targetType) ||
-                typeof(Font).IsAssignableFrom(targetType) ||
-                typeof(Shader).IsAssignableFrom(targetType) ||
-                typeof(ComputeShader).IsAssignableFrom(targetType) ||
-                typeof(GameObject).IsAssignableFrom(targetType) && findTerm.StartsWith("Assets/")) // Prefab check
-            {
-                // Try loading directly by path/GUID first
-                UnityEngine.Object asset = AssetDatabase.LoadAssetAtPath(findTerm, targetType);
-                if (asset != null) return asset;
-                asset = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(findTerm); // Try generic if type specific failed
-                if (asset != null && targetType.IsAssignableFrom(asset.GetType())) return asset;
-
-
-                // If direct path failed, try finding by name/type using FindAssets
-                string searchFilter = $"t:{targetType.Name} {System.IO.Path.GetFileNameWithoutExtension(findTerm)}"; // Search by type and name
-                string[] guids = AssetDatabase.FindAssets(searchFilter);
-
-                if (guids.Length == 1)
-                {
-                    asset = AssetDatabase.LoadAssetAtPath(AssetDatabase.GUIDToAssetPath(guids[0]), targetType);
-                    if (asset != null) return asset;
-                }
-                else if (guids.Length > 1)
-                {
-                    Debug.LogWarning($"[FindObjectByInstruction] Ambiguous asset find: Found {guids.Length} assets matching filter '{searchFilter}'. Provide a full path or unique name.");
-                    // Optionally return the first one? Or null? Returning null is safer.
-                    return null;
-                }
-                // If still not found, fall through to scene search (though unlikely for assets)
-            }
-
-
-            // --- Scene Object Search ---
-            // Find the GameObject using the internal finder
-            GameObject foundGo = FindObjectInternal(new JValue(findTerm), searchMethodToUse);
-
-            if (foundGo == null)
-            {
-                // Don't warn yet, could still be an asset not found above
-                // Debug.LogWarning($"Could not find GameObject using instruction: {instruction}");
-                return null;
-            }
-
-            // Now, get the target object/component from the found GameObject
-            if (targetType == typeof(GameObject))
-            {
-                return foundGo; // We were looking for a GameObject
-            }
-            else if (typeof(Component).IsAssignableFrom(targetType))
-            {
-                Type componentToGetType = targetType;
-                if (!string.IsNullOrEmpty(componentName))
-                {
-                    Type specificCompType = FindType(componentName);
-                    if (specificCompType != null && typeof(Component).IsAssignableFrom(specificCompType))
-                    {
-                        componentToGetType = specificCompType;
-                    }
-                    else
-                    {
-                        Debug.LogWarning($"Could not find component type '{componentName}' specified in find instruction. Falling back to target type '{targetType.Name}'.");
-                    }
-                }
-
-                Component foundComp = foundGo.GetComponent(componentToGetType);
-                if (foundComp == null)
-                {
-                    Debug.LogWarning($"Found GameObject '{foundGo.name}' but could not find component of type '{componentToGetType.Name}'.");
-                }
-                return foundComp;
-            }
-            else
-            {
-                Debug.LogWarning($"Find instruction handling not implemented for target type: {targetType.Name}");
-                return null;
-            }
+            return ObjectResolver.Resolve(instruction, targetType);
         }
 
 
@@ -2594,7 +1939,7 @@ namespace MCPForUnity.Editor.Tools
             // Log the resolver error if type wasn't found
             if (!string.IsNullOrEmpty(error))
             {
-                Debug.LogWarning($"[FindType] {error}");
+                McpLog.Warn($"[FindType] {error}");
             }
 
             return null;
@@ -2602,125 +1947,18 @@ namespace MCPForUnity.Editor.Tools
     }
 
     /// <summary>
-    /// Robust component resolver that avoids Assembly.LoadFrom and supports assembly definitions.
-    /// Prioritizes runtime (Player) assemblies over Editor assemblies.
+    /// Component resolver that delegates to UnityTypeResolver.
+    /// Kept for backwards compatibility.
     /// </summary>
     internal static class ComponentResolver
     {
-        private static readonly Dictionary<string, Type> CacheByFqn = new(StringComparer.Ordinal);
-        private static readonly Dictionary<string, Type> CacheByName = new(StringComparer.Ordinal);
-
         /// <summary>
         /// Resolve a Component/MonoBehaviour type by short or fully-qualified name.
-        /// Prefers runtime (Player) script assemblies; falls back to Editor assemblies.
-        /// Never uses Assembly.LoadFrom.
+        /// Delegates to UnityTypeResolver.TryResolve with Component constraint.
         /// </summary>
         public static bool TryResolve(string nameOrFullName, out Type type, out string error)
         {
-            error = string.Empty;
-            type = null!;
-
-            // Handle null/empty input
-            if (string.IsNullOrWhiteSpace(nameOrFullName))
-            {
-                error = "Component name cannot be null or empty";
-                return false;
-            }
-
-            // 1) Exact cache hits
-            if (CacheByFqn.TryGetValue(nameOrFullName, out type)) return true;
-            if (!nameOrFullName.Contains(".") && CacheByName.TryGetValue(nameOrFullName, out type)) return true;
-            type = Type.GetType(nameOrFullName, throwOnError: false);
-            if (IsValidComponent(type)) { Cache(type); return true; }
-
-            // 2) Search loaded assemblies (prefer Player assemblies)
-            var candidates = FindCandidates(nameOrFullName);
-            if (candidates.Count == 1) { type = candidates[0]; Cache(type); return true; }
-            if (candidates.Count > 1) { error = Ambiguity(nameOrFullName, candidates); type = null!; return false; }
-
-#if UNITY_EDITOR
-            // 3) Last resort: Editor-only TypeCache (fast index)
-            var tc = TypeCache.GetTypesDerivedFrom<Component>()
-                              .Where(t => NamesMatch(t, nameOrFullName));
-            candidates = PreferPlayer(tc).ToList();
-            if (candidates.Count == 1) { type = candidates[0]; Cache(type); return true; }
-            if (candidates.Count > 1) { error = Ambiguity(nameOrFullName, candidates); type = null!; return false; }
-#endif
-
-            error = $"Component type '{nameOrFullName}' not found in loaded runtime assemblies. " +
-                    "Use a fully-qualified name (Namespace.TypeName) and ensure the script compiled.";
-            type = null!;
-            return false;
-        }
-
-        private static bool NamesMatch(Type t, string q) =>
-            t.Name.Equals(q, StringComparison.Ordinal) ||
-            (t.FullName?.Equals(q, StringComparison.Ordinal) ?? false);
-
-        private static bool IsValidComponent(Type t) =>
-            t != null && typeof(Component).IsAssignableFrom(t);
-
-        private static void Cache(Type t)
-        {
-            if (t.FullName != null) CacheByFqn[t.FullName] = t;
-            CacheByName[t.Name] = t;
-        }
-
-        private static List<Type> FindCandidates(string query)
-        {
-            bool isShort = !query.Contains('.');
-            var loaded = AppDomain.CurrentDomain.GetAssemblies();
-
-#if UNITY_EDITOR
-            // Names of Player (runtime) script assemblies (asmdefs + Assembly-CSharp)
-            var playerAsmNames = new HashSet<string>(
-                UnityEditor.Compilation.CompilationPipeline.GetAssemblies(UnityEditor.Compilation.AssembliesType.Player).Select(a => a.name),
-                StringComparer.Ordinal);
-
-            IEnumerable<System.Reflection.Assembly> playerAsms = loaded.Where(a => playerAsmNames.Contains(a.GetName().Name));
-            IEnumerable<System.Reflection.Assembly> editorAsms = loaded.Except(playerAsms);
-#else
-            IEnumerable<System.Reflection.Assembly> playerAsms = loaded;
-            IEnumerable<System.Reflection.Assembly> editorAsms = Array.Empty<System.Reflection.Assembly>();
-#endif
-            static IEnumerable<Type> SafeGetTypes(System.Reflection.Assembly a)
-            {
-                try { return a.GetTypes(); }
-                catch (ReflectionTypeLoadException rtle) { return rtle.Types.Where(t => t != null)!; }
-            }
-
-            Func<Type, bool> match = isShort
-                ? (t => t.Name.Equals(query, StringComparison.Ordinal))
-                : (t => t.FullName!.Equals(query, StringComparison.Ordinal));
-
-            var fromPlayer = playerAsms.SelectMany(SafeGetTypes)
-                                       .Where(IsValidComponent)
-                                       .Where(match);
-            var fromEditor = editorAsms.SelectMany(SafeGetTypes)
-                                       .Where(IsValidComponent)
-                                       .Where(match);
-
-            var list = new List<Type>(fromPlayer);
-            if (list.Count == 0) list.AddRange(fromEditor);
-            return list;
-        }
-
-#if UNITY_EDITOR
-        private static IEnumerable<Type> PreferPlayer(IEnumerable<Type> seq)
-        {
-            var player = new HashSet<string>(
-                UnityEditor.Compilation.CompilationPipeline.GetAssemblies(UnityEditor.Compilation.AssembliesType.Player).Select(a => a.name),
-                StringComparer.Ordinal);
-
-            return seq.OrderBy(t => player.Contains(t.Assembly.GetName().Name) ? 0 : 1);
-        }
-#endif
-
-        private static string Ambiguity(string query, IEnumerable<Type> cands)
-        {
-            var lines = cands.Select(t => $"{t.FullName} (assembly {t.Assembly.GetName().Name})");
-            return $"Multiple component types matched '{query}':\n - " + string.Join("\n - ", lines) +
-                   "\nProvide a fully qualified type name to disambiguate.";
+            return UnityTypeResolver.TryResolve(nameOrFullName, out type, out error, typeof(Component));
         }
 
         /// <summary>
@@ -2747,45 +1985,28 @@ namespace MCPForUnity.Editor.Tools
         }
 
         /// <summary>
-        /// Uses AI to suggest the most likely property matches for a user's input.
+        /// Suggests the most likely property matches for a user's input using fuzzy matching.
+        /// Uses Levenshtein distance, substring matching, and common naming pattern heuristics.
         /// </summary>
-        public static List<string> GetAIPropertySuggestions(string userInput, List<string> availableProperties)
+        public static List<string> GetFuzzyPropertySuggestions(string userInput, List<string> availableProperties)
         {
             if (string.IsNullOrWhiteSpace(userInput) || !availableProperties.Any())
                 return new List<string>();
 
-            // Simple caching to avoid repeated AI calls for the same input
+            // Simple caching to avoid repeated lookups for the same input
             var cacheKey = $"{userInput.ToLowerInvariant()}:{string.Join(",", availableProperties)}";
             if (PropertySuggestionCache.TryGetValue(cacheKey, out var cached))
                 return cached;
 
             try
             {
-                var prompt = $"A Unity developer is trying to set a component property but used an incorrect name.\n\n" +
-                             $"User requested: \"{userInput}\"\n" +
-                             $"Available properties: [{string.Join(", ", availableProperties)}]\n\n" +
-                             $"Find 1-3 most likely matches considering:\n" +
-                             $"- Unity Inspector display names vs actual field names (e.g., \"Max Reach Distance\" → \"maxReachDistance\")\n" +
-                             $"- camelCase vs PascalCase vs spaces\n" +
-                             $"- Similar meaning/semantics\n" +
-                             $"- Common Unity naming patterns\n\n" +
-                             $"Return ONLY the matching property names, comma-separated, no quotes or explanation.\n" +
-                             $"If confidence is low (<70%), return empty string.\n\n" +
-                             $"Examples:\n" +
-                             $"- \"Max Reach Distance\" → \"maxReachDistance\"\n" +
-                             $"- \"Health Points\" → \"healthPoints, hp\"\n" +
-                             $"- \"Move Speed\" → \"moveSpeed, movementSpeed\"";
-
-                // For now, we'll use a simple rule-based approach that mimics AI behavior
-                // This can be replaced with actual AI calls later
                 var suggestions = GetRuleBasedSuggestions(userInput, availableProperties);
-
                 PropertySuggestionCache[cacheKey] = suggestions;
                 return suggestions;
             }
             catch (Exception ex)
             {
-                Debug.LogWarning($"[AI Property Matching] Error getting suggestions for '{userInput}': {ex.Message}");
+                McpLog.Warn($"[Property Matching] Error getting suggestions for '{userInput}': {ex.Message}");
                 return new List<string>();
             }
         }

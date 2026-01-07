@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 
 from fastmcp import Context
+from mcp.types import ToolAnnotations
 
 from services.registry import mcp_for_unity_tool
 from services.tools import get_unity_instance_from_context
@@ -22,7 +23,11 @@ from transport.legacy.unity_connection import async_send_command_with_retry
 
 
 @mcp_for_unity_tool(
-    description="Creates and modifies ScriptableObject assets using Unity SerializedObject property paths."
+    description="Creates and modifies ScriptableObject assets using Unity SerializedObject property paths.",
+    annotations=ToolAnnotations(
+        title="Manage Scriptable Object",
+        destructiveHint=True,
+    ),
 )
 async def manage_scriptable_object(
     ctx: Context,
@@ -36,6 +41,8 @@ async def manage_scriptable_object(
     target: Annotated[dict[str, Any] | str | None, "Target asset reference {guid|path} (for modify)."] = None,
     # --- shared ---
     patches: Annotated[list[dict[str, Any]] | str | None, "Patch list (or JSON string) to apply."] = None,
+    # --- validation ---
+    dry_run: Annotated[bool | str | None, "If true, validate patches without applying (modify only)."] = None,
 ) -> dict[str, Any]:
     unity_instance = get_unity_instance_from_context(ctx)
 
@@ -57,6 +64,7 @@ async def manage_scriptable_object(
         "overwrite": coerce_bool(overwrite, default=None),
         "target": parsed_target,
         "patches": parsed_patches,
+        "dryRun": coerce_bool(dry_run, default=None),
     }
 
     # Remove None values to keep Unity handler simpler

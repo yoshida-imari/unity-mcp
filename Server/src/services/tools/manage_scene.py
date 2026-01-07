@@ -1,15 +1,22 @@
 from typing import Annotated, Literal, Any
 
 from fastmcp import Context
+from mcp.types import ToolAnnotations
+
 from services.registry import mcp_for_unity_tool
 from services.tools import get_unity_instance_from_context
 from services.tools.utils import coerce_int, coerce_bool
 from transport.unity_transport import send_with_unity_instance
 from transport.legacy.unity_connection import async_send_command_with_retry
+from services.tools.preflight import preflight
 
 
 @mcp_for_unity_tool(
-    description="Performs CRUD operations on Unity scenes."
+    description="Performs CRUD operations on Unity scenes. Read-only actions: get_hierarchy, get_active, get_build_settings, screenshot. Modifying actions: create, load, save.",
+    annotations=ToolAnnotations(
+        title="Manage Scene",
+        destructiveHint=True,
+    ),
 )
 async def manage_scene(
     ctx: Context,
@@ -40,6 +47,9 @@ async def manage_scene(
     # Get active instance from session state
     # Removed session_state import
     unity_instance = get_unity_instance_from_context(ctx)
+    gate = await preflight(ctx, wait_for_no_compile=True, refresh_if_dirty=True)
+    if gate is not None:
+        return gate.model_dump()
     try:
         coerced_build_index = coerce_int(build_index, default=None)
         coerced_super_size = coerce_int(screenshot_super_size, default=None)

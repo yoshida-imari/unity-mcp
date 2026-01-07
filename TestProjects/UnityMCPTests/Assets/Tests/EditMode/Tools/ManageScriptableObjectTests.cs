@@ -5,18 +5,19 @@ using NUnit.Framework;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.TestTools;
-using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Tools;
 using MCPForUnityTests.Editor.Tools.Fixtures;
+using static MCPForUnityTests.Editor.TestUtilities;
 
 namespace MCPForUnityTests.Editor.Tools
 {
     public class ManageScriptableObjectTests
     {
         private const string TempRoot = "Assets/Temp/ManageScriptableObjectTests";
-        private const string NestedFolder = TempRoot + "/Nested/Deeper";
         private const double UnityReadyTimeoutSeconds = 180.0;
 
+        private string _runRoot;
+        private string _nestedFolder;
         private string _createdAssetPath;
         private string _createdGuid;
         private string _matAPath;
@@ -27,12 +28,12 @@ namespace MCPForUnityTests.Editor.Tools
         {
             yield return WaitForUnityReady(UnityReadyTimeoutSeconds);
             EnsureFolder("Assets/Temp");
-            // Start from a clean slate every time (prevents intermittent setup failures).
-            if (AssetDatabase.IsValidFolder(TempRoot))
-            {
-                AssetDatabase.DeleteAsset(TempRoot);
-            }
+            // Avoid deleting/recreating the entire TempRoot each test (can trigger heavy reimport churn).
+            // Instead, isolate each test in its own unique subfolder under TempRoot.
             EnsureFolder(TempRoot);
+            _runRoot = $"{TempRoot}/Run_{Guid.NewGuid():N}";
+            EnsureFolder(_runRoot);
+            _nestedFolder = _runRoot + "/Nested/Deeper";
 
             _createdAssetPath = null;
             _createdGuid = null;
@@ -40,10 +41,7 @@ namespace MCPForUnityTests.Editor.Tools
             // Create two Materials we can reference by guid/path.
             _matAPath = $"{TempRoot}/MatA_{Guid.NewGuid():N}.mat";
             _matBPath = $"{TempRoot}/MatB_{Guid.NewGuid():N}.mat";
-            var shader = Shader.Find("Universal Render Pipeline/Lit")
-                ?? Shader.Find("HDRP/Lit")
-                ?? Shader.Find("Standard")
-                ?? Shader.Find("Unlit/Color");
+            var shader = FindFallbackShader();
             Assert.IsNotNull(shader, "A fallback shader must be available for creating Material assets in tests.");
             AssetDatabase.CreateAsset(new Material(shader), _matAPath);
             AssetDatabase.CreateAsset(new Material(shader), _matBPath);
@@ -69,41 +67,27 @@ namespace MCPForUnityTests.Editor.Tools
                 AssetDatabase.DeleteAsset(_matBPath);
             }
 
-            if (AssetDatabase.IsValidFolder(TempRoot))
+            if (!string.IsNullOrEmpty(_runRoot) && AssetDatabase.IsValidFolder(_runRoot))
             {
-                AssetDatabase.DeleteAsset(TempRoot);
+                AssetDatabase.DeleteAsset(_runRoot);
             }
 
-            // Clean up parent Temp folder if empty
-            if (AssetDatabase.IsValidFolder("Assets/Temp"))
-            {
-                var remainingDirs = System.IO.Directory.GetDirectories("Assets/Temp");
-                var remainingFiles = System.IO.Directory.GetFiles("Assets/Temp");
-                if (remainingDirs.Length == 0 && remainingFiles.Length == 0)
-                {
-                    AssetDatabase.DeleteAsset("Assets/Temp");
-                }
-            }
+            // Clean up empty parent folders to avoid debris
+            CleanupEmptyParentFolders(TempRoot);
 
             AssetDatabase.Refresh();
         }
 
         [Test]
-        public void Create_CreatesNestedFolders_PlacesAssetCorrectly_AndAppliesPatches()
+        public void Create_CreatesNestedFolders_PlacesAssetCorrectly()
         {
             var create = new JObject
             {
                 ["action"] = "create",
                 ["typeName"] = typeof(ManageScriptableObjectTestDefinition).FullName,
-                ["folderPath"] = NestedFolder,
-                ["assetName"] = "My_Test_Def",
+                ["folderPath"] = _nestedFolder,
+                ["assetName"] = "My_Test_Def_Placement",
                 ["overwrite"] = true,
-                ["patches"] = new JArray
-                {
-                    new JObject { ["propertyPath"] = "displayName", ["op"] = "set", ["value"] = "Hello" },
-                    new JObject { ["propertyPath"] = "baseNumber", ["op"] = "set", ["value"] = 42 },
-                    new JObject { ["propertyPath"] = "nested.note", ["op"] = "set", ["value"] = "note!" }
-                }
             };
 
             var raw = ManageScriptableObject.HandleCommand(create);
@@ -116,9 +100,45 @@ namespace MCPForUnityTests.Editor.Tools
             _createdGuid = data!["guid"]?.ToString();
             _createdAssetPath = data["path"]?.ToString();
 
-            Assert.IsTrue(AssetDatabase.IsValidFolder(NestedFolder), "Nested folder should be created.");
-            Assert.IsTrue(_createdAssetPath!.StartsWith(NestedFolder, StringComparison.Ordinal), $"Asset should be created under {NestedFolder}: {_createdAssetPath}");
+            Assert.IsTrue(AssetDatabase.IsValidFolder(_nestedFolder), "Nested folder should be created.");
+            Assert.IsTrue(_createdAssetPath!.StartsWith(_nestedFolder, StringComparison.Ordinal), $"Asset should be created under {_nestedFolder}: {_createdAssetPath}");
             Assert.IsTrue(_createdAssetPath.EndsWith(".asset", StringComparison.OrdinalIgnoreCase), "Asset should have .asset extension.");
+            Assert.IsFalse(string.IsNullOrWhiteSpace(_createdGuid), "Expected guid in response.");
+
+            var asset = AssetDatabase.LoadAssetAtPath<ManageScriptableObjectTestDefinition>(_createdAssetPath);
+            Assert.IsNotNull(asset, "Created asset should load as TestDefinition.");
+        }
+
+        [Test]
+        public void Create_AppliesPatches_ToCreatedAsset()
+        {
+            var create = new JObject
+            {
+                ["action"] = "create",
+                ["typeName"] = typeof(ManageScriptableObjectTestDefinition).FullName,
+                // Patching correctness does not depend on nested folder creation; keep this lightweight.
+                ["folderPath"] = _runRoot,
+                ["assetName"] = "My_Test_Def_Patches",
+                ["overwrite"] = true,
+                ["patches"] = new JArray
+                {
+                    new JObject { ["propertyPath"] = "displayName", ["op"] = "set", ["value"] = "Hello" },
+                    new JObject { ["propertyPath"] = "baseNumber", ["op"] = "set", ["value"] = 42 },
+                    new JObject { ["propertyPath"] = "nested.note", ["op"] = "set", ["value"] = "note!" }
+                }
+            };
+
+            var raw = ManageScriptableObject.HandleCommand(create);
+            var result = raw as JObject ?? JObject.FromObject(raw);
+            Assert.IsTrue(result.Value<bool>("success"), result.ToString());
+
+            var data = result["data"] as JObject;
+            Assert.IsNotNull(data, "Expected data payload");
+
+            _createdGuid = data!["guid"]?.ToString();
+            _createdAssetPath = data["path"]?.ToString();
+
+            Assert.IsTrue(_createdAssetPath!.StartsWith(_runRoot, StringComparison.Ordinal), $"Asset should be created under {_runRoot}: {_createdAssetPath}");
             Assert.IsFalse(string.IsNullOrWhiteSpace(_createdGuid), "Expected guid in response.");
 
             var asset = AssetDatabase.LoadAssetAtPath<ManageScriptableObjectTestDefinition>(_createdAssetPath);
@@ -136,7 +156,7 @@ namespace MCPForUnityTests.Editor.Tools
             {
                 ["action"] = "create",
                 ["typeName"] = typeof(ManageScriptableObjectTestDefinition).FullName,
-                ["folderPath"] = TempRoot,
+                ["folderPath"] = _runRoot,
                 ["assetName"] = "Modify_Target",
                 ["overwrite"] = true
             };
@@ -280,50 +300,6 @@ namespace MCPForUnityTests.Editor.Tools
             Assert.IsTrue(path!.StartsWith("Assets/Temp/ManageScriptableObjectTests/SlashProbe/Deep", StringComparison.Ordinal),
                 $"Expected sanitized Assets-rooted path, got: {path}");
             Assert.IsFalse(path.Contains("//", StringComparison.Ordinal), $"Path should not contain double slashes: {path}");
-        }
-
-        private static void EnsureFolder(string folderPath)
-        {
-            if (AssetDatabase.IsValidFolder(folderPath))
-                return;
-
-            // Only used for Assets/... paths in tests.
-            var sanitized = AssetPathUtility.SanitizeAssetPath(folderPath);
-            if (string.Equals(sanitized, "Assets", StringComparison.OrdinalIgnoreCase))
-                return;
-
-            var parts = sanitized.Split('/');
-            string current = "Assets";
-            for (int i = 1; i < parts.Length; i++)
-            {
-                var next = current + "/" + parts[i];
-                if (!AssetDatabase.IsValidFolder(next))
-                {
-                    AssetDatabase.CreateFolder(current, parts[i]);
-                }
-                current = next;
-            }
-        }
-
-        private static JObject ToJObject(object result)
-        {
-            return result as JObject ?? JObject.FromObject(result);
-        }
-
-        private static IEnumerator WaitForUnityReady(double timeoutSeconds = 30.0)
-        {
-            // Some EditMode tests trigger script compilation/domain reload. Tools like ManageScriptableObject
-            // intentionally return "compiling_or_reloading" during these windows. Wait until Unity is stable
-            // to make tests deterministic.
-            double start = EditorApplication.timeSinceStartup;
-            while (EditorApplication.isCompiling || EditorApplication.isUpdating)
-            {
-                if (EditorApplication.timeSinceStartup - start > timeoutSeconds)
-                {
-                    Assert.Fail($"Timed out waiting for Unity to finish compiling/updating (>{timeoutSeconds:0.0}s).");
-                }
-                yield return null; // yield to the editor loop so importing/compiling can actually progress
-            }
         }
     }
 }
