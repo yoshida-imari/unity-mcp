@@ -515,12 +515,29 @@ namespace MCPForUnity.Editor.Tools
 
                 List<GameObject> nodes;
                 string scope;
+                string sceneName = activeScene.name;
 
                 GameObject parentGo = ResolveGameObject(cmd.parent, activeScene);
                 if (cmd.parent == null || cmd.parent.Type == JTokenType.Null)
                 {
                     try { McpLog.Info("[ManageScene] get_hierarchy: listing root objects (paged summary)", always: false); } catch { }
                     nodes = activeScene.GetRootGameObjects().Where(go => go != null).ToList();
+
+                    // DontDestroyOnLoadシーンのオブジェクトも常に含める（プレイモード時のみ）
+                    try
+                    {
+                        var dontDestroyObjects = GetDontDestroyOnLoadObjects();
+                        if (dontDestroyObjects.Count > 0)
+                        {
+                            nodes.AddRange(dontDestroyObjects);
+                            sceneName = $"{activeScene.name} + DontDestroyOnLoad";
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        try { McpLog.Info($"[ManageScene] get_hierarchy: failed to get DontDestroyOnLoad objects: {ex.Message}", always: false); } catch { }
+                    }
+
                     scope = "roots";
                 }
                 else
@@ -564,7 +581,7 @@ namespace MCPForUnity.Editor.Tools
                     items = items,
                 };
 
-                var resp = new SuccessResponse($"Retrieved hierarchy page for scene '{activeScene.name}'.", payload);
+                var resp = new SuccessResponse($"Retrieved hierarchy page for scene '{sceneName}'.", payload);
                 try { McpLog.Info("[ManageScene] get_hierarchy: success", always: false); } catch { }
                 return resp;
             }
@@ -750,6 +767,40 @@ namespace MCPForUnity.Editor.Tools
             };
 
             return gameObjectData;
+        }
+
+        /// <summary>
+        /// DontDestroyOnLoadシーンのルートGameObjectを取得する
+        /// </summary>
+        private static List<GameObject> GetDontDestroyOnLoadObjects()
+        {
+            var result = new List<GameObject>();
+
+            // プレイモードでない場合は空を返す（DontDestroyOnLoadはプレイモードでのみ存在）
+            if (!Application.isPlaying)
+            {
+                return result;
+            }
+
+            // 一時オブジェクトを作成してDontDestroyOnLoadシーンを取得
+            GameObject temp = new GameObject("__MCP_Temp_DontDestroyOnLoad__");
+            UnityEngine.Object.DontDestroyOnLoad(temp);
+            Scene dontDestroyScene = temp.scene;
+            UnityEngine.Object.DestroyImmediate(temp);
+
+            if (dontDestroyScene.IsValid())
+            {
+                var rootObjects = dontDestroyScene.GetRootGameObjects();
+                foreach (var go in rootObjects)
+                {
+                    if (go != null)
+                    {
+                        result.Add(go);
+                    }
+                }
+            }
+
+            return result;
         }
     }
 }
